@@ -98,6 +98,7 @@ _MAX_TOTAL_TENSORS = 200_000
 _MAX_LIVE_SOURCE_HANDLES = 2
 
 _INDEX_NAME = "index.json"
+_RESHARDING_INDEX_NAME = "index.json.resharding"
 _EXTRAS_NAME = "extras.safetensors"
 _SHARD_FORMAT_VERSION = 5
 _LARGE_EMBED_ROLE = "embed_tokens"
@@ -608,9 +609,9 @@ def _stripe_marker_problem(
     return None
 
 
-def read_shard_index(out_dir: str) -> ShardIndex:
-    """Read ``index.json``. Raises on a missing or malformed index."""
-    path = os.path.join(out_dir, _INDEX_NAME)
+def read_shard_index(out_dir: str, *, index_name: str = _INDEX_NAME) -> ShardIndex:
+    """Read a shard index. Raises on a missing or malformed index."""
+    path = os.path.join(out_dir, index_name)
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
     # `quant` defaults to "none" so a v0.72.0/.1 bf16 cache stays valid for a
@@ -989,6 +990,10 @@ def inspect_shard_cache(
     reverse would feed packed nibbles to a plain ``Linear``), so the cache key
     covers the quantisation and its double-quant flag too.
     """
+    index_path = os.path.join(out_dir, _INDEX_NAME)
+    interrupted_path = os.path.join(out_dir, _RESHARDING_INDEX_NAME)
+    if not os.path.exists(index_path) and os.path.exists(interrupted_path):
+        return None, "a previous re-shard did not finish"
     try:
         index = read_shard_index(out_dir)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
@@ -1055,6 +1060,30 @@ def inspect_shard_cache(
                 return None, f"cached shard {os.path.basename(path)!r} is missing"
             return None, f"cached shard {path} is missing"
     return index, "cache is reusable"
+
+
+def _content_will_change(
+    index: ShardIndex,
+    *,
+    dtype: str,
+    fingerprint: str,
+    quant: str,
+    double_quant: bool,
+    quant_device: str,
+    external_mode: str,
+) -> bool:
+    """Whether rewriting this cache can change bytes named by the old index."""
+    return any(
+        (
+            index.dtype != dtype,
+            index.quant != quant,
+            index.quant != QUANT_NONE and index.double_quant != double_quant,
+            index.quant != QUANT_NONE and index.quant_device != quant_device,
+            index.source_fingerprint != fingerprint,
+            index.external_mode != external_mode,
+            index.format_version != _SHARD_FORMAT_VERSION,
+        )
+    )
 
 
 # ==========================================================================
@@ -1233,6 +1262,19 @@ def shard_checkpoint(
         include_config=bool(external_mode),
     )
     fingerprint = _fingerprint_components(source_files)
+    try:
+        previous_index = read_shard_index(resolved_out)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        previous_index = None
+    content_will_change = previous_index is not None and _content_will_change(
+        previous_index,
+        dtype=dtype,
+        fingerprint=fingerprint,
+        quant=quant,
+        double_quant=double_quant,
+        quant_device=device_kind,
+        external_mode=external_mode,
+    )
     if not force:
         cached, miss_reason = inspect_shard_cache(
             resolved_out,
@@ -1246,6 +1288,8 @@ def shard_checkpoint(
             stripe_roots=stripe,
         )
         if cached is not None:
+            if notify is not None:
+                _notify_unindexed_cache_files(resolved_out, cached, notify)
             return cached
         if notify is not None:
             from soup_cli.utils.terminal import for_terminal
@@ -1468,6 +1512,12 @@ def shard_checkpoint(
     # Collected here, deleted only after the new index commits — see the comment beside the
     # deletion below for why.
     stale_root0_copies: List[str] = []
+    interrupted_index = os.path.join(resolved_out, _RESHARDING_INDEX_NAME)
+    if content_will_change:
+        # The old index is the cache's commit point. Remove it atomically before any file it
+        # names can receive different bytes, so a crash can never advertise a mixed cache as
+        # reusable. Layout-only rewrites keep the old index because their bytes are identical.
+        os.replace(os.path.join(resolved_out, _INDEX_NAME), interrupted_index)
     # At most _MAX_LIVE_SOURCE_HANDLES source files are mapped at once (#926);
     # a failed open, or a raise anywhere below, still releases the live ones.
     with _SourceHandles(shards, safe_open) as handles:
@@ -1738,6 +1788,20 @@ def shard_checkpoint(
                     f"({for_terminal(exc)}); the cache is complete without it — delete it to "
                     f"reclaim the space.[/]"
                 )
+    try:
+        os.remove(interrupted_index)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if notify is not None:
+            from soup_cli.utils.terminal import for_terminal
+
+            notify(
+                f"[yellow]Could not remove the completed re-shard marker "
+                f"{for_terminal(interrupted_index)} ({for_terminal(exc)}).[/]"
+            )
+    if notify is not None:
+        _notify_unindexed_cache_files(resolved_out, index, notify)
     return index
 
 
@@ -1763,7 +1827,10 @@ def _notify_orphaned_stripes(
     try:
         previous = read_shard_index(out_dir)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return
+        try:
+            previous = read_shard_index(out_dir, index_name=_RESHARDING_INDEX_NAME)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return
     from soup_cli.utils.stripe_roots import stripe_folder_problem
     from soup_cli.utils.terminal import for_terminal
 
@@ -1779,6 +1846,41 @@ def _notify_orphaned_stripes(
             f"({_folder_bytes(folder) / 1e9:.2f} GB); this layout no longer does. Delete it "
             f"to reclaim the space.[/]"
         )
+
+
+def _notify_unindexed_cache_files(
+    out_dir: str, index: ShardIndex, notify: Callable[[str], None]
+) -> None:
+    """Report Soup-owned cache files that the committed index does not name."""
+    from soup_cli.utils.terminal import for_terminal
+
+    expected = {
+        os.path.normcase(os.path.realpath(path)) for path in layer_paths(out_dir, index)
+    }
+    for directory in stripe_dirs(out_dir, index.stripe_roots):
+        try:
+            with os.scandir(directory) as entries:
+                candidates = list(entries)
+        except OSError:
+            continue
+        for entry in candidates:
+            name = entry.name
+            is_layer = name.startswith("layer_") and name.endswith(".safetensors")
+            is_temp = name.startswith(".soup.") and name.endswith(".tmp")
+            if not (is_layer or is_temp) or not entry.is_file(follow_symlinks=False):
+                continue
+            path = os.path.normcase(os.path.realpath(entry.path))
+            if path in expected:
+                continue
+            try:
+                size = entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                size = 0
+            notify(
+                f"[yellow]Unindexed cache file {for_terminal(entry.path)} "
+                f"({size} bytes) is not used by the committed index. Delete it to reclaim "
+                f"the space.[/]"
+            )
 
 
 def _require_all_quantised(suffixes: Tuple[str, ...], matched: Iterable[str]) -> None:

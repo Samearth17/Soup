@@ -1,8 +1,10 @@
 """R4 — the sharder places layer i on root i mod N, and keeps the cache honest about it."""
 
 import os
+from io import StringIO
 
 import pytest
+from rich.console import Console
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("safetensors")
@@ -145,6 +147,156 @@ def test_an_interrupted_reshard_leaves_the_old_index_consistent(layout, monkeypa
 
     shard_checkpoint(src, out, dtype="float32", stripe_roots=(stripe,))
     assert not os.path.exists(layer_shard_path(out, 1))
+
+
+@pytest.mark.parametrize("striped", [False, True])
+@pytest.mark.parametrize("interrupt_at", ["layers", "index"])
+def test_content_change_interrupt_is_a_miss_and_repairs_the_cache(
+    tmp_path, monkeypatch, striped, interrupt_at
+):
+    """#1616: content-changing writes cannot leave the old index reusable."""
+    import soup_cli.utils.layer_shard as layer_shard_mod
+
+    src = _weights(tmp_path, n_layers=4)
+    out = str(tmp_path / "cache" / "model")
+    stripe = tmp_path / "stripe"
+    stripe.mkdir()
+    roots = (str(stripe),) if striped else ()
+    shard_checkpoint(src, out, dtype="float32", stripe_roots=roots)
+
+    with monkeypatch.context() as patch:
+        if interrupt_at == "layers":
+            real_save = layer_shard_mod._atomic_save
+            writes = 0
+
+            def stop_after_two_layers(blob, path):
+                nonlocal writes
+                if os.path.basename(path).startswith("layer_"):
+                    writes += 1
+                    if writes == 3:
+                        raise KeyboardInterrupt("interrupted")
+                return real_save(blob, path)
+
+            patch.setattr(layer_shard_mod, "_atomic_save", stop_after_two_layers)
+        else:
+
+            def stop_at_index(*_args, **_kwargs):
+                raise KeyboardInterrupt("interrupted")
+
+            patch.setattr(layer_shard_mod, "_atomic_write_index", stop_at_index)
+
+        with pytest.raises(KeyboardInterrupt, match="interrupted"):
+            shard_checkpoint(src, out, dtype="bfloat16", stripe_roots=roots)
+
+    assert not os.path.exists(os.path.join(out, "index.json"))
+    assert os.path.exists(os.path.join(out, "index.json.resharding"))
+
+    said = []
+    repaired = shard_checkpoint(
+        src, out, dtype="float32", stripe_roots=roots, notify=said.append
+    )
+    assert any("previous re-shard did not finish" in line for line in said), said
+    assert not os.path.exists(os.path.join(out, "index.json.resharding"))
+    for path in layer_paths(out, repaired):
+        assert {tensor.dtype for tensor in load_file(path).values()} == {torch.float32}
+
+
+def test_layout_change_reports_unindexed_layers_in_a_kept_stripe(tmp_path):
+    src = _weights(tmp_path, n_layers=6)
+    out = str(tmp_path / "cache" / "model")
+    first = tmp_path / "stripe-a"
+    second = tmp_path / "stripe-b"
+    first.mkdir()
+    second.mkdir()
+    shard_checkpoint(src, out, dtype="float32", stripe_roots=(str(first),))
+
+    said = []
+    shard_checkpoint(
+        src,
+        out,
+        dtype="float32",
+        stripe_roots=(str(first), str(second)),
+        notify=said.append,
+    )
+
+    old_folder = stripe_dirs(out, (os.path.realpath(first),))[1]
+    for layer in (3, 5):
+        path = layer_shard_path(old_folder, layer)
+        assert os.path.exists(path)
+        assert any(path in line and "bytes" in line for line in said), said
+
+
+def test_recovery_reads_the_parked_index_to_name_an_abandoned_stripe(layout, monkeypatch):
+    import soup_cli.utils.layer_shard as layer_shard_mod
+
+    src, out, stripe = layout
+    shard_checkpoint(src, out, dtype="float32", stripe_roots=(stripe,))
+    folder = _folder(out, stripe)
+
+    with monkeypatch.context() as patch:
+
+        def interrupt_first_write(*_args, **_kwargs):
+            raise KeyboardInterrupt("interrupted")
+
+        patch.setattr(layer_shard_mod, "_atomic_save", interrupt_first_write)
+        with pytest.raises(KeyboardInterrupt, match="interrupted"):
+            shard_checkpoint(src, out, dtype="bfloat16", stripe_roots=(stripe,))
+
+    said = []
+    shard_checkpoint(src, out, dtype="float32", notify=said.append)
+    assert any(folder in line and "previous layer cache" in line for line in said), said
+
+
+def test_cache_hit_reports_a_stale_primary_copy_after_interrupted_delete(layout, monkeypatch):
+    import soup_cli.utils.layer_shard as layer_shard_mod
+
+    src, out, stripe = layout
+    shard_checkpoint(src, out, dtype="float32")
+    stale = layer_shard_path(out, 1)
+    real_remove = layer_shard_mod.os.remove
+
+    def interrupt_delete(path, *args, **kwargs):
+        if os.path.normcase(os.path.normpath(path)) == os.path.normcase(
+            os.path.normpath(stale)
+        ):
+            raise KeyboardInterrupt("interrupted after commit")
+        return real_remove(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(layer_shard_mod.os, "remove", interrupt_delete)
+        with pytest.raises(KeyboardInterrupt, match="after commit"):
+            shard_checkpoint(src, out, dtype="float32", stripe_roots=(stripe,))
+
+    said = []
+    shard_checkpoint(src, out, dtype="float32", stripe_roots=(stripe,), notify=said.append)
+    assert os.path.exists(stale)
+    assert any(stale in line and "Unindexed cache file" in line for line in said), said
+
+
+def test_cache_hit_reports_and_preserves_a_temp_file_with_markup_in_its_path(tmp_path):
+    src = _weights(tmp_path)
+    out = str(tmp_path / "cache" / "model")
+    stripe = tmp_path / "stripe[bold]"
+    stripe.mkdir()
+    shard_checkpoint(src, out, dtype="float32", stripe_roots=(str(stripe),))
+    folder = _folder(out, str(stripe))
+    temp = os.path.join(folder, ".soup.x.tmp")
+    with open(temp, "wb") as handle:
+        handle.write(b"leftover")
+
+    stream = StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None, width=1000)
+    shard_checkpoint(
+        src,
+        out,
+        dtype="float32",
+        stripe_roots=(str(stripe),),
+        notify=console.print,
+    )
+
+    output = stream.getvalue()
+    assert temp in output and "8 bytes" in output
+    assert os.path.exists(temp)
 
 
 def test_a_stale_copy_that_will_not_delete_still_returns_the_committed_index(layout, monkeypatch):
